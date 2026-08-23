@@ -569,6 +569,132 @@ class TestVerdictCoercion:
         proposal_id = _propose(contract, direct_vm, verdict="MOSTLY_FINE")
         assert contract.evaluate_proposal(proposal_id=proposal_id) == "INCOMPLETE"
 
+    @pytest.mark.parametrize("cased_verdict", ["faithful", "Faithful", "FaItHfUl"])
+    def test_case_insensitive_verdict_is_still_recognized(
+        self, contract, direct_vm, cased_verdict
+    ):
+        """Regression for a real robustness gap found in a strict
+        post-build review: a model that writes "Faithful" instead of
+        "FAITHFUL" is not being dishonest, just inconsistent about
+        casing -- it should not be penalized with an unearned
+        INCOMPLETE. Matching is case-insensitive; the stored/returned
+        verdict is always the canonical uppercase form regardless."""
+        _register(contract, direct_vm)
+        direct_vm.clear_mocks()
+        direct_vm.mock_llm(
+            ".*", json.dumps({"verdict": cased_verdict, "reason": "Matches."})
+        )
+        proposal_id = contract.propose_upgrade(
+            protocol_id=DEFAULT_PROTOCOL,
+            new_content=json.dumps({"fee_bps": "50", "admin": "0xOldAdminAddress"}),
+            changelog="Fee change.",
+        )
+        assert contract.evaluate_proposal(proposal_id=proposal_id) == "FAITHFUL"
+        record = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        assert record["verdict"] == "FAITHFUL"  # always canonical, whatever the model wrote
+
+    def test_case_insensitive_verdict_still_fails_closed_on_genuine_garbage(
+        self, contract, direct_vm
+    ):
+        """The case-insensitivity fix must not widen the fail-closed
+        net -- text that isn't even a close variant of a valid verdict
+        must still fall back to INCOMPLETE."""
+        _register(contract, direct_vm)
+        direct_vm.clear_mocks()
+        direct_vm.mock_llm(
+            ".*", json.dumps({"verdict": "sort of faithful I guess", "reason": "Unsure."})
+        )
+        proposal_id = contract.propose_upgrade(
+            protocol_id=DEFAULT_PROTOCOL,
+            new_content=json.dumps({"fee_bps": "50", "admin": "0xOldAdminAddress"}),
+            changelog="Fee change.",
+        )
+        assert contract.evaluate_proposal(proposal_id=proposal_id) == "INCOMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# Stale-proposal guard -- regression for a real state-integrity bug found in
+# a strict post-build review: accepting a proposal computed against an
+# earlier protocol version than the one currently live could silently
+# discard whatever an intervening, already-applied upgrade changed.
+# ---------------------------------------------------------------------------
+
+
+class TestStaleProposalGuard:
+    def test_accepting_a_stale_proposal_is_rejected_not_silently_clobbered(
+        self, contract, direct_vm
+    ):
+        _register(contract, direct_vm, content=json.dumps(
+            {"fee_bps": "30", "admin": "0xOldAdminAddress"}
+        ))
+
+        # Two proposals submitted against the SAME (version 0) baseline,
+        # before either is accepted -- a realistic scenario in a
+        # permissionless proposal flow, not a contrived race.
+        proposal_a = _propose(
+            contract, direct_vm,
+            new_content=json.dumps({"fee_bps": "50", "admin": "0xOldAdminAddress"}),
+            changelog="Increased fee_bps from 30 to 50.",
+            verdict="FAITHFUL",
+        )
+        proposal_b = _propose(
+            contract, direct_vm,
+            new_content=json.dumps({"fee_bps": "30", "admin": "0xNewAdminAddress"}),
+            changelog="Rotated the admin address.",
+            verdict="FAITHFUL",
+        )
+
+        # A is evaluated and accepted first -- protocol moves to version 1.
+        contract.evaluate_proposal(proposal_id=proposal_a)
+        contract.accept_proposal(proposal_id=proposal_a)
+        protocol = json.loads(contract.get_protocol(protocol_id=DEFAULT_PROTOCOL))
+        assert protocol["version"] == 1
+        assert protocol["content"]["fee_bps"] == "50"
+
+        # B is independently judged FAITHFUL too (its own diff, against
+        # its own -- now stale -- version-0 baseline, is genuinely
+        # honestly described). Accepting it must be REJECTED, not
+        # silently applied: applying B's new_content as stored (computed
+        # from v0) would revert fee_bps back to "30", discarding A's
+        # already-applied change.
+        contract.evaluate_proposal(proposal_id=proposal_b)
+        with pytest.raises(Exception):
+            contract.accept_proposal(proposal_id=proposal_b)
+
+        # The clobber never happened -- A's change is still in effect.
+        protocol = json.loads(contract.get_protocol(protocol_id=DEFAULT_PROTOCOL))
+        assert protocol["content"]["fee_bps"] == "50"
+        assert protocol["version"] == 1
+
+    def test_a_fresh_proposal_against_the_current_version_still_applies_normally(
+        self, contract, direct_vm
+    ):
+        """The guard must not block ordinary, non-stale acceptance --
+        only prevent a stale one."""
+        _register(contract, direct_vm)
+        first = _propose(contract, direct_vm, verdict="FAITHFUL")
+        contract.evaluate_proposal(proposal_id=first)
+        contract.accept_proposal(proposal_id=first)
+
+        second = _propose(
+            contract, direct_vm,
+            new_content=json.dumps({"fee_bps": "60", "admin": "0xOldAdminAddress"}),
+            changelog="Further increased fee_bps to 60.",
+            verdict="FAITHFUL",
+        )
+        contract.evaluate_proposal(proposal_id=second)
+        contract.accept_proposal(proposal_id=second)  # must not raise
+
+        protocol = json.loads(contract.get_protocol(protocol_id=DEFAULT_PROTOCOL))
+        assert protocol["content"]["fee_bps"] == "60"
+        assert protocol["version"] == 2
+
+    def test_proposal_record_exposes_based_on_version(self, contract, direct_vm):
+        _register(contract, direct_vm)
+        proposal_id = _propose(contract, direct_vm, verdict="FAITHFUL")
+        record = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        assert record["based_on_version"] == 0
+
     def test_json_wrapped_in_prose_is_still_extracted(self, contract, direct_vm):
         _register(contract, direct_vm)
         direct_vm.clear_mocks()

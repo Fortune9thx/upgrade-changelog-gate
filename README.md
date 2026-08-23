@@ -6,11 +6,11 @@ A reusable GenLayer Intelligent Contract primitive that verifies a proposed upgr
 
 **Network:** GenLayer Bradbury Testnet
 
-**Contract:** [`0x60553Fb5BAE7E4681a330169e2c17E8dde414f97`](https://explorer-bradbury.genlayer.com/address/0x60553Fb5BAE7E4681a330169e2c17E8dde414f97)
+**Contract:** [`0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf`](https://explorer-bradbury.genlayer.com/address/0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf)
 
-Deploy tx `0x2cd73a50a9b3cdc33db642487ca68d5a6020d018c6cd19abe4b4b850e2c6b4f8` reached `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable.
+Deploy tx `0x651d80f7619235eab4b93be9b65d45b6c43508981a586e6400c7ec6093ad557a` reached `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable. This is the 1.1.0 redeployment carrying the [security review](#security-review) fixes -- it supersedes `0x60553Fb5BAE7E4681a330169e2c17E8dde414f97` (1.0.0), kept in CHANGELOG.md for history.
 
-**This deployment has a real, full live transaction sequence behind it, not just a bare deploy.** A genuine `register_protocol` → `propose_upgrade` → `evaluate_proposal` sequence was run end to end, using a deliberately adversarial scenario (a changelog that silently omits an admin-address change alongside a disclosed fee change). The real, unscripted model call correctly classified this as `INCOMPLETE` -- and independent validator consensus agreed and finalized that verdict on-chain. Full transaction record, the model's own reasoning, and why `INCOMPLETE` (not `MISLEADING`) is the precise, correct classification for silent omission: [`docs/DESIGN.md`](docs/DESIGN.md#live-verification).
+**This deployment lineage has a real, full live transaction sequence behind it, not just a bare deploy.** A genuine `register_protocol` → `propose_upgrade` → `evaluate_proposal` sequence was run end to end against the 1.0.0 deployment, using a deliberately adversarial scenario (a changelog that silently omits an admin-address change alongside a disclosed fee change). The real, unscripted model call correctly classified this as `INCOMPLETE` -- and independent validator consensus agreed and finalized that verdict on-chain. The 1.1.0 fixes below changed only deterministic code (`leader_fn`/`validator_fn` and the underlying consensus mechanism are unchanged), so this transaction record still stands as the live proof of the non-deterministic mechanism. Full record, the model's own reasoning, and why `INCOMPLETE` (not `MISLEADING`) is the precise, correct classification for silent omission: [`docs/DESIGN.md`](docs/DESIGN.md#live-verification).
 
 ## The trust problem
 
@@ -124,7 +124,7 @@ def get_proposal_count(self) -> u256
 
 ## Testing
 
-43 direct-mode tests in [`tests/direct/test_upgrade_changelog_gate.py`](tests/direct/test_upgrade_changelog_gate.py), covering the full register → propose → evaluate → accept lifecycle, the signature adversarial scenario (an honest fee-change changelog; a changelog that silently omits an admin-address change, correctly judged `INCOMPLETE`, matching the real live-network result below; and a changelog with an active false claim about that same field, correctly judged `MISLEADING`), stake routing on all three verdicts, ownership/authorization on every owner-gated method, permissionless proposal and evaluation, re-evaluation and double-apply guards, full input validation, deterministic diff computation (added/removed/modified), the manipulation-heuristic screen, verdict fail-closed coercion, and **validator independence** -- direct tests proving `validator_fn` genuinely re-derives its own verdict and rejects a leader's mismatched claim while ignoring reason-text differences.
+50 direct-mode tests in [`tests/direct/test_upgrade_changelog_gate.py`](tests/direct/test_upgrade_changelog_gate.py), covering the full register → propose → evaluate → accept lifecycle, the signature adversarial scenario (an honest fee-change changelog; a changelog that silently omits an admin-address change, correctly judged `INCOMPLETE`, matching the real live-network result below; and a changelog with an active false claim about that same field, correctly judged `MISLEADING`), stake routing on all three verdicts, ownership/authorization on every owner-gated method, permissionless proposal and evaluation, re-evaluation and double-apply guards, full input validation, deterministic diff computation (added/removed/modified), the manipulation-heuristic screen, case-insensitive and fail-closed verdict coercion, the **stale-proposal guard** (`TestStaleProposalGuard`: reproducing the exact two-competing-proposals scenario and proving the clobber is rejected, not just that ordinary acceptance still works), and **validator independence** -- direct tests proving `validator_fn` genuinely re-derives its own verdict and rejects a leader's mismatched claim while ignoring reason-text differences.
 
 ```bash
 gltest tests/direct/ -v
@@ -132,7 +132,16 @@ genvm-lint check contracts/UpgradeChangelogGate.py
 genvm-lint typecheck contracts/UpgradeChangelogGate.py
 ```
 
-All three pass clean: 43/43 tests, zero lint warnings, zero type errors. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all three on every push and pull request.
+All three pass clean: 50/50 tests, zero lint warnings, zero type errors. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all three on every push and pull request.
+
+## Security review
+
+A strict post-build audit (2026-08-23), deliberately trying to break the design rather than confirm it, found and closed two real gaps beyond the initial build:
+
+1. **`accept_proposal` had no protection against applying a stale proposal.** With permissionless, open proposing, two proposals could exist against the same baseline before either was accepted; accepting the second afterward would silently overwrite the protocol's content with a diff computed against the now-stale first baseline, discarding whatever the first upgrade changed for any field the second proposal didn't also touch -- a real "lost update" bug. Fixed by binding every proposal to the exact protocol version its diff was computed against (`based_on_version`) and rejecting acceptance if the protocol has since moved. Regression-tested by actually reproducing the two-competing-proposals scenario and proving the clobber does not happen.
+2. **Verdict matching was exact-case only.** A model writing `"Faithful"` instead of `"FAITHFUL"` -- a casing inconsistency, not dishonesty -- would fail closed to `INCOMPLETE` unnecessarily. Fixed with case-insensitive matching that still always stores the canonical uppercase form, with zero change to the fail-closed direction for genuinely invalid output.
+
+Both fixes are covered by dedicated regression tests proving the actual scenario is handled correctly, not just that the happy path still works. Full writeup: [`docs/DESIGN.md`](docs/DESIGN.md#trust-boundaries).
 
 ## License
 

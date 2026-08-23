@@ -345,6 +345,11 @@ class UpgradeChangelogGate(gl.Contract):
             "reason": None,
             "submitted_at": gl.message_raw.get("datetime", ""),
             "evaluated_at": None,
+            # The protocol version this proposal's diff was computed
+            # against -- accept_proposal checks this hasn't moved before
+            # applying, closing a real stale-overwrite bug found in a
+            # strict post-build review (see docs/DESIGN.md).
+            "based_on_version": int(protocol["version"]),
         }
         self.proposals[proposal_id] = json.dumps(record)
         self.protocol_latest_proposal[key] = proposal_id
@@ -471,7 +476,23 @@ class UpgradeChangelogGate(gl.Contract):
         "is this changelog honest" (GenLayer's job, above) from "do we
         want this change" (the owner's own call, here). An INCOMPLETE or
         MISLEADING proposal can never be accepted, regardless of who
-        calls this."""
+        calls this.
+
+        Also requires the protocol to still be at the exact version this
+        proposal's diff was computed against (`based_on_version`). Without
+        this check, accepting a second, independently-FAITHFUL proposal
+        that was computed against an *earlier* baseline than one already
+        applied would silently overwrite the protocol's content with
+        new_content computed from that stale baseline -- discarding
+        whatever the intervening upgrade changed for any field this
+        proposal doesn't also happen to touch, with no error and no
+        trace. A strict post-build review found this as a real, concrete
+        state-integrity gap, not a hypothetical one: nothing about the
+        permissionless proposal flow prevents multiple proposals pending
+        against the same baseline, and the contract previously gave the
+        owner no protection against accepting them out of order. A stale
+        proposal must be rejected here; the correct remedy is for its
+        proposer to submit a fresh proposal against the current version."""
         raw_proposal = self.proposals.get(proposal_id)
         if raw_proposal is None:
             raise gl.vm.UserError(f"no proposal found for id: {proposal_id}")
@@ -501,8 +522,19 @@ class UpgradeChangelogGate(gl.Contract):
         if sender != protocol["owner"]:
             raise gl.vm.UserError("only the protocol owner may accept a proposal")
 
+        current_version = int(protocol["version"])
+        if current_version != int(proposal["based_on_version"]):
+            raise gl.vm.UserError(
+                f"proposal {proposal_id} is stale: it was computed against "
+                f"version {proposal['based_on_version']}, but the protocol "
+                f"is now at version {current_version}. Propose a fresh "
+                "upgrade against the current version instead of applying "
+                "this one -- accepting it would silently discard whatever "
+                "changed in between."
+            )
+
         protocol["content"] = proposal["new_content"]
-        protocol["version"] = int(protocol["version"]) + 1
+        protocol["version"] = current_version + 1
         self.protocols[key] = json.dumps(protocol)
 
         proposal["applied"] = True
@@ -733,20 +765,27 @@ def _coerce_verdict(raw) -> dict:
     vocabulary directly, which structurally avoids the whole class of
     numeric-edge-case bug (e.g. non-finite floats silently snapping to
     an unintended bucket) that a numeric scale would need explicit
-    guards against. Anything that is not exactly one of the three valid
-    strings fails closed to "INCOMPLETE" -- deliberately neither the
-    trusting extreme ("FAITHFUL", which would grant unearned trust to
-    unparseable output) nor the punitive extreme ("MISLEADING", which
-    would forfeit a proposer's stake over a model/infrastructure hiccup
-    that is not evidence of dishonesty). "INCOMPLETE" refunds the stake
-    and blocks the pointer flip either way -- the safe, neutral default
-    for "this could not be confidently judged honest."""
+    guards against. Matching is case-insensitive (a model that writes
+    "Faithful" or "incomplete" is not being dishonest, just
+    inconsistent about casing despite the prompt's exact-case
+    instruction -- there is no reason to fail that closed) but the
+    canonical uppercase string is always what gets stored/returned, so
+    every consumer of this contract's state sees exactly one consistent
+    casing regardless of what the model produced. Anything that is not
+    a case-insensitive match to one of the three valid strings fails
+    closed to "INCOMPLETE" -- deliberately neither the trusting extreme
+    ("FAITHFUL", which would grant unearned trust to unparseable
+    output) nor the punitive extreme ("MISLEADING", which would forfeit
+    a proposer's stake over a model/infrastructure hiccup that is not
+    evidence of dishonesty). "INCOMPLETE" refunds the stake and blocks
+    the pointer flip either way -- the safe, neutral default for "this
+    could not be confidently judged honest."""
     parsed = _parse_json_object(raw)
-    verdict = parsed.get("verdict")
-    if not isinstance(verdict, str) or verdict.strip() not in VALID_VERDICTS:
-        verdict = "INCOMPLETE"
+    raw_verdict = parsed.get("verdict")
+    if isinstance(raw_verdict, str) and raw_verdict.strip().upper() in VALID_VERDICTS:
+        verdict = raw_verdict.strip().upper()
     else:
-        verdict = verdict.strip()
+        verdict = "INCOMPLETE"
     reason = str(parsed.get("reason", "")).strip() or "No reason provided."
     reason = reason[:MAX_REASON_CHARS]
     return {"verdict": verdict, "reason": reason}
