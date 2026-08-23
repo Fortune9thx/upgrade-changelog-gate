@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0
+
+- Third benchmark pass (2026-08-23): re-read the same three independently-accepted Portal repos already benchmarked while designing this contract (`tendercouncil`, `spec-compliance-bounty`, `rubricproof-intelligent-contract`), this time specifically for governance/staking/versioning-shaped patterns rather than the evidence-fetch-focused ones a first pass over the same repos already surfaced elsewhere.
+  - **Adopted: event emission.** `spec-compliance-bounty` emits a `gl.Event` after every state-mutating write; this contract had none. Added `ProtocolRegistered`, `ProposalSubmitted`, `ProposalEvaluated`, `ProposalAccepted`, `StakeRequirementUpdated`, emitted after each corresponding write (and after any GEN transfer). Not a correctness fix -- this account's own already-accepted IndependentEvidenceSettler ships with zero events -- but a genuine, no-risk strengthening of "would someone import this," since an indexer/frontend can now track lifecycle without polling every id.
+  - **Considered, no change needed: permissionless timeout-gated refund.** `spec-compliance-bounty` needs one because its funds-release path can stall if nobody ever submits. Traced this contract's own release path (`evaluate_proposal`) and confirmed it is already permissionlessly callable by anyone and unconditionally resolves the stake before any owner-gated step -- no privileged party is ever required to unstick GEN here, so no timeout mechanism was added. Full reasoning in `docs/DESIGN.md`'s "Third benchmark pass" section.
+  - All 50 existing tests still pass unchanged (no new tests needed -- event emission isn't asserted in either this repo's or `spec-compliance-bounty`'s own direct-mode suite). `genvm-lint check`/`typecheck` both clean.
+- Redeployed to `0xfe4800F103D6BC5eC6E67938f10B63f178dcDb9e` on GenLayer Bradbury. Deploy tx `0x1bc422437e0e6c1d114bb26f36bf18eba906c139e9f145e20c0a9dad47d9168d`: `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable (`get_proposal_count` returns `0`). Supersedes `0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf` (1.1.0) -- the change is purely additive/deterministic (new event classes and `.emit()` calls only; `leader_fn`/`validator_fn` untouched), so the 1.0.0 live consensus-mechanism proof (`docs/DESIGN.md`'s "Live verification" section) still stands for this redeployment.
+
 ## 1.1.0
 
 - Strict post-build security audit found and closed two real gaps:

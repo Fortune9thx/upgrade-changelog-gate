@@ -6,9 +6,9 @@ A reusable GenLayer Intelligent Contract primitive that verifies a proposed upgr
 
 **Network:** GenLayer Bradbury Testnet
 
-**Contract:** [`0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf`](https://explorer-bradbury.genlayer.com/address/0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf)
+**Contract:** [`0xfe4800F103D6BC5eC6E67938f10B63f178dcDb9e`](https://explorer-bradbury.genlayer.com/address/0xfe4800F103D6BC5eC6E67938f10B63f178dcDb9e)
 
-Deploy tx `0x651d80f7619235eab4b93be9b65d45b6c43508981a586e6400c7ec6093ad557a` reached `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable. This is the 1.1.0 redeployment carrying the [security review](#security-review) fixes -- it supersedes `0x60553Fb5BAE7E4681a330169e2c17E8dde414f97` (1.0.0), kept in CHANGELOG.md for history.
+Deploy tx `0x1bc422437e0e6c1d114bb26f36bf18eba906c139e9f145e20c0a9dad47d9168d` reached `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable (`get_proposal_count` returns `0`). This is the 1.2.0 redeployment, adding event emission for every state-mutating write (see [Third benchmark pass](#third-benchmark-pass)) -- it supersedes `0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf` (1.1.0) and `0x60553Fb5BAE7E4681a330169e2c17E8dde414f97` (1.0.0), both kept in CHANGELOG.md for history.
 
 **This deployment lineage has a real, full live transaction sequence behind it, not just a bare deploy.** A genuine `register_protocol` → `propose_upgrade` → `evaluate_proposal` sequence was run end to end against the 1.0.0 deployment, using a deliberately adversarial scenario (a changelog that silently omits an admin-address change alongside a disclosed fee change). The real, unscripted model call correctly classified this as `INCOMPLETE` -- and independent validator consensus agreed and finalized that verdict on-chain. The 1.1.0 fixes below changed only deterministic code (`leader_fn`/`validator_fn` and the underlying consensus mechanism are unchanged), so this transaction record still stands as the live proof of the non-deterministic mechanism. Full record, the model's own reasoning, and why `INCOMPLETE` (not `MISLEADING`) is the precise, correct classification for silent omission: [`docs/DESIGN.md`](docs/DESIGN.md#live-verification).
 
@@ -90,6 +90,8 @@ def get_latest_proposal_for_protocol(self, protocol_id: str) -> str
 def get_proposal_count(self) -> u256
 ```
 
+Every state-mutating write also emits a `gl.Event` (`ProtocolRegistered`, `ProposalSubmitted`, `ProposalEvaluated`, `ProposalAccepted`, `StakeRequirementUpdated`) so an off-chain indexer or frontend can track the full lifecycle without polling every `proposal_id` -- added in 1.2.0, see [Third benchmark pass](#third-benchmark-pass).
+
 ## Proposal record schema
 
 `get_proposal` returns a JSON string decoding to:
@@ -142,6 +144,10 @@ A strict post-build audit (2026-08-23), deliberately trying to break the design 
 2. **Verdict matching was exact-case only.** A model writing `"Faithful"` instead of `"FAITHFUL"` -- a casing inconsistency, not dishonesty -- would fail closed to `INCOMPLETE` unnecessarily. Fixed with case-insensitive matching that still always stores the canonical uppercase form, with zero change to the fail-closed direction for genuinely invalid output.
 
 Both fixes are covered by dedicated regression tests proving the actual scenario is handled correctly, not just that the happy path still works. Full writeup: [`docs/DESIGN.md`](docs/DESIGN.md#trust-boundaries).
+
+## Third benchmark pass
+
+A third pass (2026-08-23) re-read the same three independently-accepted Portal repos already benchmarked while designing this contract -- `tendercouncil`, `spec-compliance-bounty`, `rubricproof-intelligent-contract` -- this time specifically for governance/staking/versioning-shaped patterns. It found one adopted improvement (event emission for lifecycle tracking, matching a convention observed in `spec-compliance-bounty`) and one pattern deliberately *not* adopted after being traced through this contract's own write paths (a permissionless timeout-gated refund escape, unnecessary here because `evaluate_proposal` already permissionlessly and unconditionally resolves every staked GEN amount before any owner-gated step). Full reasoning: [`docs/DESIGN.md`](docs/DESIGN.md#third-benchmark-pass-2026-08-23----re-screened-for-governancestaking-shaped-patterns).
 
 ## License
 
