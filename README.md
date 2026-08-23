@@ -6,7 +6,11 @@ A reusable GenLayer Intelligent Contract primitive that verifies a proposed upgr
 
 **Network:** GenLayer Bradbury Testnet
 
-**Contract:** _to be filled in after deployment -- see [CHANGELOG.md](CHANGELOG.md) for the current live address once deployed._
+**Contract:** [`0x60553Fb5BAE7E4681a330169e2c17E8dde414f97`](https://explorer-bradbury.genlayer.com/address/0x60553Fb5BAE7E4681a330169e2c17E8dde414f97)
+
+Deploy tx `0x2cd73a50a9b3cdc33db642487ca68d5a6020d018c6cd19abe4b4b850e2c6b4f8` reached `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable.
+
+**This deployment has a real, full live transaction sequence behind it, not just a bare deploy.** A genuine `register_protocol` → `propose_upgrade` → `evaluate_proposal` sequence was run end to end, using a deliberately adversarial scenario (a changelog that silently omits an admin-address change alongside a disclosed fee change). The real, unscripted model call correctly classified this as `INCOMPLETE` -- and independent validator consensus agreed and finalized that verdict on-chain. Full transaction record, the model's own reasoning, and why `INCOMPLETE` (not `MISLEADING`) is the precise, correct classification for silent omission: [`docs/DESIGN.md`](docs/DESIGN.md#live-verification).
 
 ## The trust problem
 
@@ -120,7 +124,7 @@ def get_proposal_count(self) -> u256
 
 ## Testing
 
-42 direct-mode tests in [`tests/direct/test_upgrade_changelog_gate.py`](tests/direct/test_upgrade_changelog_gate.py), covering the full register → propose → evaluate → accept lifecycle, the signature adversarial scenario (an honest fee-change changelog vs. one that silently omits an admin-address change judged `MISLEADING`), stake routing on all three verdicts, ownership/authorization on every owner-gated method, permissionless proposal and evaluation, re-evaluation and double-apply guards, full input validation, deterministic diff computation (added/removed/modified), the manipulation-heuristic screen, verdict fail-closed coercion, and **validator independence** -- direct tests proving `validator_fn` genuinely re-derives its own verdict and rejects a leader's mismatched claim while ignoring reason-text differences.
+43 direct-mode tests in [`tests/direct/test_upgrade_changelog_gate.py`](tests/direct/test_upgrade_changelog_gate.py), covering the full register → propose → evaluate → accept lifecycle, the signature adversarial scenario (an honest fee-change changelog; a changelog that silently omits an admin-address change, correctly judged `INCOMPLETE`, matching the real live-network result below; and a changelog with an active false claim about that same field, correctly judged `MISLEADING`), stake routing on all three verdicts, ownership/authorization on every owner-gated method, permissionless proposal and evaluation, re-evaluation and double-apply guards, full input validation, deterministic diff computation (added/removed/modified), the manipulation-heuristic screen, verdict fail-closed coercion, and **validator independence** -- direct tests proving `validator_fn` genuinely re-derives its own verdict and rejects a leader's mismatched claim while ignoring reason-text differences.
 
 ```bash
 gltest tests/direct/ -v
@@ -128,7 +132,7 @@ genvm-lint check contracts/UpgradeChangelogGate.py
 genvm-lint typecheck contracts/UpgradeChangelogGate.py
 ```
 
-All three pass clean: 42/42 tests, zero lint warnings, zero type errors. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all three on every push and pull request.
+All three pass clean: 43/43 tests, zero lint warnings, zero type errors. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all three on every push and pull request.
 
 ## License
 

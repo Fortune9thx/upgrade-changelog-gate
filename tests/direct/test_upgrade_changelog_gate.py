@@ -118,8 +118,13 @@ class TestHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# The core demonstration: an honest changelog vs. a changelog that smuggles
-# an undisclosed admin-key change under an innocuous fee-change description.
+# The core demonstration: an honest changelog vs. two different dishonest
+# ones -- a silent omission and an active false claim -- distinguishing
+# INCOMPLETE from MISLEADING exactly as the contract's own definitions
+# require. The omission case's expected verdict here (INCOMPLETE) was
+# corrected after live-network testing showed this is the real, correct
+# classification -- see docs/DESIGN.md's "Live verification" section for
+# the full transaction record and the model's own unscripted reasoning.
 # ---------------------------------------------------------------------------
 
 
@@ -134,32 +139,64 @@ class TestSignatureScenario:
         )
         assert contract.evaluate_proposal(proposal_id=proposal_id) == "FAITHFUL"
 
-    def test_smuggled_admin_change_is_flagged_by_the_llm_as_misleading(
+    def test_smuggled_admin_change_by_silent_omission_is_incomplete(
         self, contract, direct_vm
     ):
-        """The realistic adversarial case this contract exists for: the
-        diff shows BOTH fee_bps and admin changed, but the changelog only
-        mentions the fee change -- a real proposer would do this to
-        smuggle a privilege-escalating admin-key change past reviewers
-        who only read the prose. The contract's own deterministic diff
-        computation captures the undisclosed change regardless of what
-        the changelog says; here we simulate the (expected, correct)
-        outcome of an honest LLM judgment against that diff."""
+        """A realistic adversarial case: the diff shows BOTH fee_bps and
+        admin changed, but the changelog only mentions the fee change --
+        a real proposer might do this to smuggle a privilege-escalating
+        admin-key change past reviewers who only read the prose. Verified
+        live on Bradbury (tx 0x36a0f4d362dcb95efebd7c56b279d6fc8ca4d5980640e8ab28a27ac8d574c761,
+        proposal-0 on 0x60553Fb5BAE7E4681a330169e2c17E8dde414f97): a real,
+        unscripted model call correctly classified this exact scenario as
+        INCOMPLETE, not MISLEADING -- and that is the *correct* reading of
+        the contract's own bucket definitions: the changelog never claims
+        anything false about the admin field, it simply never mentions it
+        at all, which is precisely what "INCOMPLETE" is defined to mean.
+        The live model's real reason: "The changelog describes the
+        fee_bps increase from 30 to 50 but omits the modification of the
+        admin field... a critical change not mentioned." This mock
+        reproduces that same, now-verified-correct classification rather
+        than the MISLEADING assumption this test originally (and
+        incorrectly) encoded before live testing corrected it."""
         _register(contract, direct_vm)
         proposal_id = _propose(
             contract, direct_vm,
             new_content=json.dumps({"fee_bps": "50", "admin": "0xNewAttackerAddress"}),
             changelog="Increased fee_bps from 30 to 50 to fund development.",
-            verdict="MISLEADING",
+            verdict="INCOMPLETE",
         )
         verdict = contract.evaluate_proposal(proposal_id=proposal_id)
-        assert verdict == "MISLEADING"
+        assert verdict == "INCOMPLETE"
 
         proposal = json.loads(contract.get_proposal(proposal_id=proposal_id))
         admin_change = next(d for d in proposal["diff"] if d["field"] == "admin")
         assert admin_change["change"] == "modified"
         assert admin_change["old_value"] == "0xOldAdminAddress"
         assert admin_change["new_value"] == "0xNewAttackerAddress"
+
+    def test_active_false_claim_about_the_admin_field_is_misleading(
+        self, contract, direct_vm
+    ):
+        """The genuinely MISLEADING case per the contract's own
+        definitions: the changelog does not merely omit the admin
+        change, it makes an explicit claim about that field that the
+        diff directly contradicts -- an active falsehood, not a silent
+        gap. This is the sharper adversarial case than pure omission:
+        a proposer confident enough to assert something false, betting
+        reviewers won't check."""
+        _register(contract, direct_vm)
+        proposal_id = _propose(
+            contract, direct_vm,
+            new_content=json.dumps({"fee_bps": "50", "admin": "0xNewAttackerAddress"}),
+            changelog=(
+                "Increased fee_bps from 30 to 50 to fund development. "
+                "The admin address was not changed in this upgrade."
+            ),
+            verdict="MISLEADING",
+        )
+        verdict = contract.evaluate_proposal(proposal_id=proposal_id)
+        assert verdict == "MISLEADING"
 
     def test_misleading_verdict_blocks_accept(self, contract, direct_vm):
         _register(contract, direct_vm)
