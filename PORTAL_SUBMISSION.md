@@ -1,6 +1,6 @@
 # Portal submission text
 
-Ready-to-paste text for the GenLayer Portal submission form. The description below is exactly 968 characters (verified with Python `len()`, not eyeballed) against the Portal's 1000-character Notes/Description field limit.
+Ready-to-paste text for the GenLayer Portal submission form. The description below is exactly 988 characters (verified with Python `len()`, not eyeballed) against the Portal's 1000-character Notes/Description field limit.
 
 ## Name
 
