@@ -6,9 +6,9 @@ A reusable GenLayer Intelligent Contract primitive that verifies a proposed upgr
 
 **Network:** GenLayer Bradbury Testnet
 
-**Contract:** [`0xfe4800F103D6BC5eC6E67938f10B63f178dcDb9e`](https://explorer-bradbury.genlayer.com/address/0xfe4800F103D6BC5eC6E67938f10B63f178dcDb9e)
+**Contract:** [`0xb56C016DFe03744B02ff8DeD1E35e0b4d73f2C0D`](https://explorer-bradbury.genlayer.com/address/0xb56C016DFe03744B02ff8DeD1E35e0b4d73f2C0D)
 
-Deploy tx `0x1bc422437e0e6c1d114bb26f36bf18eba906c139e9f145e20c0a9dad47d9168d` reached `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable (`get_proposal_count` returns `0`). This is the 1.2.0 redeployment, adding event emission for every state-mutating write (see [Third benchmark pass](#third-benchmark-pass)) -- it supersedes `0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf` (1.1.0) and `0x60553Fb5BAE7E4681a330169e2c17E8dde414f97` (1.0.0), both kept in CHANGELOG.md for history.
+Deploy tx `0xe173c8db06fb40a74828a46c455996585a7ed4885e5360ab92f8842842ab9bc1` reached `ACCEPTED`/`AGREE`/`FINISHED_WITH_RETURN`, confirmed readable (`get_proposal_count` returns `0`). This is the 1.3.0 redeployment, adding `reclaim_expired_proposal` -- a bounded, permissionless escape hatch for a proposal stake stuck behind evaluation that never reaches agreement, requested by a GenLayer Portal steward's review (see [Steward review](#steward-review)) -- it supersedes `0xfe4800F103D6BC5eC6E67938f10B63f178dcDb9e` (1.2.0), `0xfd702c49bbDaD2BD47438719d85F06cAD44983Cf` (1.1.0), and `0x60553Fb5BAE7E4681a330169e2c17E8dde414f97` (1.0.0), all kept in CHANGELOG.md for history.
 
 **This deployment lineage has a real, full live transaction sequence behind it, not just a bare deploy.** A genuine `register_protocol` → `propose_upgrade` → `evaluate_proposal` sequence was run end to end against the 1.0.0 deployment, using a deliberately adversarial scenario (a changelog that silently omits an admin-address change alongside a disclosed fee change). The real, unscripted model call correctly classified this as `INCOMPLETE` -- and independent validator consensus agreed and finalized that verdict on-chain. The 1.1.0 fixes below changed only deterministic code (`leader_fn`/`validator_fn` and the underlying consensus mechanism are unchanged), so this transaction record still stands as the live proof of the non-deterministic mechanism. Full record, the model's own reasoning, and why `INCOMPLETE` (not `MISLEADING`) is the precise, correct classification for silent omission: [`docs/DESIGN.md`](docs/DESIGN.md#live-verification).
 
@@ -77,6 +77,11 @@ def accept_proposal(self, proposal_id: str) -> None
 def update_stake_requirement(self, protocol_id: str, new_min_stake: u256) -> None
     # owner-only.
 
+@gl.public.write
+def reclaim_expired_proposal(self, proposal_id: str) -> None
+    # permissionless; refunds a stake stuck behind a proposal still "pending"
+    # after PROPOSAL_EVALUATION_TIMEOUT_SECONDS (72h) of no agreed evaluation.
+
 @gl.public.view
 def get_protocol(self, protocol_id: str) -> str
 
@@ -90,7 +95,7 @@ def get_latest_proposal_for_protocol(self, protocol_id: str) -> str
 def get_proposal_count(self) -> u256
 ```
 
-Every state-mutating write also emits a `gl.Event` (`ProtocolRegistered`, `ProposalSubmitted`, `ProposalEvaluated`, `ProposalAccepted`, `StakeRequirementUpdated`) so an off-chain indexer or frontend can track the full lifecycle without polling every `proposal_id` -- added in 1.2.0, see [Third benchmark pass](#third-benchmark-pass).
+Every state-mutating write also emits a `gl.Event` (`ProtocolRegistered`, `ProposalSubmitted`, `ProposalEvaluated`, `ProposalAccepted`, `StakeRequirementUpdated`, `ProposalExpired`) so an off-chain indexer or frontend can track the full lifecycle without polling every `proposal_id` -- added in 1.2.0, see [Third benchmark pass](#third-benchmark-pass).
 
 ## Proposal record schema
 
@@ -113,10 +118,13 @@ Every state-mutating write also emits a `gl.Event` (`ProtocolRegistered`, `Propo
   "reason": "The changelog accurately describes the only field that changed.",
   "submitted_at": "2026-08-20T00:00:00Z",
   "evaluated_at": "2026-08-20T00:05:00Z",
+  "expired_at": null,
   "applied": true,
   "applied_at": "2026-08-20T00:10:00Z"
 }
 ```
+
+`status` is one of three terminal-or-pending values: `"pending"` (awaiting evaluation), `"evaluated"` (a verdict was agreed, `verdict`/`reason`/`evaluated_at` populated), or `"expired"` (no verdict was ever agreed within `PROPOSAL_EVALUATION_TIMEOUT_SECONDS`, `expired_at` populated, stake refunded to the proposer). A proposal can reach exactly one of the latter two, never both -- see [Steward review](#steward-review).
 
 `flagged` is a heuristic transparency signal for changelog text that matches common prompt-injection phrasing -- never a rejection gate, and `flagged: false` is not proof the changelog was honest, only that it didn't use an obvious pattern. `get_protocol`/`get_proposal` both return JSON-encoded strings, never a `dict`, so no return value can ever carry an un-encodable float.
 
@@ -148,6 +156,12 @@ Both fixes are covered by dedicated regression tests proving the actual scenario
 ## Third benchmark pass
 
 A third pass (2026-08-23) re-read the same three independently-accepted Portal repos already benchmarked while designing this contract -- `tendercouncil`, `spec-compliance-bounty`, `rubricproof-intelligent-contract` -- this time specifically for governance/staking/versioning-shaped patterns. It found one adopted improvement (event emission for lifecycle tracking, matching a convention observed in `spec-compliance-bounty`) and one pattern deliberately *not* adopted after being traced through this contract's own write paths (a permissionless timeout-gated refund escape, unnecessary here because `evaluate_proposal` already permissionlessly and unconditionally resolves every staked GEN amount before any owner-gated step). Full reasoning: [`docs/DESIGN.md`](docs/DESIGN.md#third-benchmark-pass-2026-08-23----re-screened-for-governancestaking-shaped-patterns).
+
+## Steward review
+
+A GenLayer Portal steward requested changes before continuing review: a proposal's stake could remain locked forever if `evaluate_proposal` never reached validator agreement. This directly overturned the third benchmark pass's own conclusion above that no escape hatch was needed -- that conclusion had conflated "permissionlessly retriable" with "guaranteed to eventually converge," which are not the same claim, and is disclosed as a genuine reasoning error rather than smoothed over.
+
+**Fix: `reclaim_expired_proposal`**, a bounded, permissionless escape hatch. Once a proposal has sat `"pending"` for at least 72h with no agreed verdict, anyone may reclaim the proposer's stake, marking the proposal `"expired"`. It shares the exact `"pending"` precondition `evaluate_proposal` itself requires, and both flip status away from `"pending"` before any GEN transfer -- which is what guarantees the stake is released exactly once, that the path cannot run after evaluation, and that it can never bypass an already-resolved forfeiture, meeting the steward's three explicit requirements directly. 8 new regression tests (`TestExpiryReclaim`) reproduce each of them. Full writeup, including a technical note on why comparing `datetime.now()` against `gl.message_raw`-sourced timestamps is safe here: [`docs/DESIGN.md`](docs/DESIGN.md#steward-review-2026-08-24----a-real-liveness-gap-this-accounts-own-third-benchmark-pass-got-wrong).
 
 ## License
 

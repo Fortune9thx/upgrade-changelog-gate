@@ -80,3 +80,7 @@ def sync_fee_parameter(self, protocol_id: str):
 ```
 
 This pull pattern -- UpgradeChangelogGate records the verified, applied content; a consumer contract reads it via `.view()` on demand -- is the verified-reliable shape for composing this primitive into a larger system on the current GenLayer Bradbury build.
+
+## If evaluation never resolves
+
+`evaluate_proposal` can, in principle, fail to reach validator agreement (a genuinely ambiguous case, or a transient infrastructure issue) -- when that happens, no state is written and the proposal stays `"pending"`, simply retriable by calling `evaluate_proposal` again. If it's been `"pending"` for at least 72 hours with no agreed verdict, anyone -- including the original proposer -- may call `reclaim_expired_proposal(proposalId)` to refund the staked GEN and mark the proposal `"expired"`. A consuming DAO's keeper/automation should treat a proposal that's been pending unusually long as a signal to retry `evaluate_proposal` first, and only fall back to `reclaim_expired_proposal` once the 72h window has genuinely elapsed.

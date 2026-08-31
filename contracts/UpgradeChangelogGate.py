@@ -109,6 +109,16 @@ never "is this upgrade a good idea," which stays the owner's call.
   itself already reached agreement; there is no code path that surfaces
   a pointer flip as done before consensus actually produced that
   verdict.
+- "Staked funds with no bounded escape hatch if consensus never
+  resolves" -- `evaluate_proposal` being permissionlessly retriable by
+  anyone is not, on its own, a guarantee it ever converges: nothing
+  prevents a genuinely ambiguous diff/changelog pair, or a persistent
+  validator-infrastructure issue, from causing every attempt to fail to
+  reach agreement indefinitely. `reclaim_expired_proposal` is the
+  bounded, permissionless escape hatch for that case -- found by a
+  GenLayer Portal steward's review, not this account's own internal
+  audits, which is disclosed plainly in docs/DESIGN.md rather than
+  smoothed over.
 
 ## The exact Equivalence Principle strategy chosen, and why
 
@@ -153,6 +163,7 @@ import json
 import re
 import typing
 import unicodedata
+from datetime import datetime, timezone
 from genlayer import *
 
 
@@ -167,6 +178,20 @@ MAX_CONTENT_KEYS = 20
 MAX_KEY_CHARS = 64
 MAX_STRING_VALUE_CHARS = 500
 MAX_REASON_CHARS = 400
+
+# Bounded wait before a still-PENDING proposal's staked GEN becomes
+# reclaimable by anyone via reclaim_expired_proposal. Closes a real
+# liveness gap: evaluate_proposal's own docstring already notes that if
+# independent validators never reach agreement, no state is written and
+# the proposal stays "pending" -- without a bounded escape hatch, that
+# would leave the proposer's stake locked in this contract permanently,
+# with no path to recover it, no matter how many times evaluate_proposal
+# is retried. Value matches the timeout window this account benchmarked
+# from spec-compliance-bounty's own permissionless-refund pattern (an
+# independently-accepted Portal submission) during a later review pass;
+# see docs/DESIGN.md for the full finding and why an earlier internal
+# pass had wrongly concluded this contract needed no such escape hatch.
+PROPOSAL_EVALUATION_TIMEOUT_SECONDS = 259200  # 72h
 
 # Protocol identifiers must look like a deliberate handle, not arbitrary
 # text -- mirrors the criterion-id convention used elsewhere on the
@@ -239,6 +264,49 @@ class ProposalAccepted(gl.Event):
 
 class StakeRequirementUpdated(gl.Event):
     def __init__(self, protocol_id: str, new_min_stake: u256, /): ...
+
+
+class ProposalExpired(gl.Event):
+    def __init__(self, proposal_id: str, protocol_id: str, proposer: Address, /): ...
+
+
+def _now_iso() -> str:
+    """Transaction-time clock. `datetime.now()` is explicitly sanctioned
+    as deterministic in GenLayer contracts -- the GenVM SDK provides a
+    consensus-agreed replacement, unlike `time.time()`/`uuid.uuid4()`,
+    which genvm-lint's own static-analysis rules (W002) forbid outright.
+    Used only for the elapsed-time comparison in
+    reclaim_expired_proposal; every other timestamp this contract stores
+    still uses `gl.message_raw.get("datetime", "")` as before, unchanged
+    -- both expose the same underlying per-transaction time, just via
+    different SDK surfaces, so mixing them for a 72-hour-scale threshold
+    comparison introduces no meaningful risk."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(s: str) -> float:
+    """Pure string parsing -- deterministic given an already-produced
+    timestamp string, whichever of the two mechanisms above produced it.
+    Returns a POSIX timestamp, or 0.0 (a deliberate 'unreadable'
+    sentinel) if unparseable -- never confused with a real timestamp
+    since no proposal can predate this contract's deployment."""
+    if not isinstance(s, str) or not s:
+        return 0.0
+    norm = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        return datetime.fromisoformat(norm).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _elapsed_seconds(now_iso: str, then_iso: str) -> float:
+    """Fails open to 0.0 ('not enough time has passed') on an unparseable
+    timestamp -- the safe direction, since this only ever gates
+    reclaim_expired_proposal from running too EARLY, never too late."""
+    now_ts, then_ts = _parse_iso(now_iso), _parse_iso(then_iso)
+    if now_ts <= 0 or then_ts <= 0:
+        return 0.0
+    return max(0.0, now_ts - then_ts)
 
 
 def _protocol_key(protocol_id: str) -> str:
@@ -376,6 +444,7 @@ class UpgradeChangelogGate(gl.Contract):
             "reason": None,
             "submitted_at": gl.message_raw.get("datetime", ""),
             "evaluated_at": None,
+            "expired_at": None,
             # The protocol version this proposal's diff was computed
             # against -- accept_proposal checks this hasn't moved before
             # applying, closing a real stale-overwrite bug found in a
@@ -415,8 +484,8 @@ class UpgradeChangelogGate(gl.Contract):
         proposal = json.loads(raw_proposal)
         if proposal["status"] != "pending":
             raise gl.vm.UserError(
-                f"proposal {proposal_id} already evaluated "
-                f"(status: {proposal['status']})"
+                f"proposal {proposal_id} is not pending "
+                f"(status: {proposal['status']}); it cannot be evaluated"
             )
 
         raw_protocol = self.protocols.get(_protocol_key(proposal["protocol_id"]))
@@ -502,6 +571,76 @@ class UpgradeChangelogGate(gl.Contract):
         ProposalEvaluated(proposal_id, verdict, u256(stake)).emit()
 
         return verdict
+
+    # -----------------------------------------------------------------
+    # Public write: reclaim a stake stuck behind a proposal that never
+    # reached agreement (bounded liveness escape hatch)
+    # -----------------------------------------------------------------
+    @gl.public.write
+    def reclaim_expired_proposal(self, proposal_id: str) -> None:
+        """Permissionlessly callable by anyone, once a still-PENDING
+        proposal has sat unevaluated for at least
+        PROPOSAL_EVALUATION_TIMEOUT_SECONDS. Refunds the proposer's
+        recorded stake and marks the proposal "expired" -- a third
+        terminal status alongside "evaluated", distinct from it so a
+        reader of get_proposal() can always tell whether a proposal was
+        actually judged or simply timed out unresolved.
+
+        Why this exists: evaluate_proposal's own docstring already notes
+        that if independent validators never reach agreement, no state is
+        written and the proposal stays "pending" -- retriable, but not
+        guaranteed to ever resolve. Being permissionlessly retriable is
+        not the same as being guaranteed to eventually converge: nothing
+        stops a genuinely ambiguous diff/changelog pair, or a persistent
+        validator-infrastructure issue, from causing every attempt to
+        fail to reach agreement indefinitely. Without a bounded escape
+        hatch, the proposer's staked GEN would then be locked in this
+        contract permanently, with literally no path to recover it no
+        matter how many times anyone calls evaluate_proposal. This method
+        is that bounded escape hatch.
+
+        Exactly-once refund, by construction: this requires the same
+        `status == "pending"` precondition evaluate_proposal itself
+        requires, and both methods flip status away from "pending"
+        before any GEN transfer. Whichever of the two executes first
+        permanently forecloses the other -- a proposal already resolved
+        by evaluate_proposal (status "evaluated", stake already refunded
+        *or* forfeited per the agreed verdict) can never subsequently be
+        reclaimed here, and an already-expired proposal can never
+        subsequently be evaluated, so a resolved forfeiture can never be
+        bypassed by this path either."""
+        raw_proposal = self.proposals.get(proposal_id)
+        if raw_proposal is None:
+            raise gl.vm.UserError(f"no proposal found for id: {proposal_id}")
+        proposal = json.loads(raw_proposal)
+
+        if proposal["status"] != "pending":
+            raise gl.vm.UserError(
+                f"proposal {proposal_id} is not pending "
+                f"(status: {proposal['status']}); it cannot be reclaimed"
+            )
+
+        now = _now_iso()
+        elapsed = _elapsed_seconds(now, str(proposal["submitted_at"]))
+        if elapsed < PROPOSAL_EVALUATION_TIMEOUT_SECONDS:
+            raise gl.vm.UserError(
+                f"proposal {proposal_id} has not yet expired "
+                f"({int(elapsed)}s elapsed of "
+                f"{PROPOSAL_EVALUATION_TIMEOUT_SECONDS}s required)"
+            )
+
+        stake = int(proposal["stake"])
+        proposer = proposal["proposer"]
+        protocol_id = proposal["protocol_id"]
+
+        proposal["status"] = "expired"
+        proposal["expired_at"] = now
+        self.proposals[proposal_id] = json.dumps(proposal)
+
+        if stake > 0:
+            gl.get_contract_at(Address(proposer)).emit_transfer(value=u256(stake))
+
+        ProposalExpired(proposal_id, protocol_id, Address(proposer)).emit()
 
     # -----------------------------------------------------------------
     # Public write: apply a FAITHFUL-verdict proposal (owner-only)

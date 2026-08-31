@@ -18,6 +18,7 @@ which replays the captured validator_fn -- see TestValidatorIndependence.
 """
 
 import json
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -343,6 +344,107 @@ class TestStateGuards:
         contract.accept_proposal(proposal_id=proposal_id)
         with pytest.raises(Exception):
             contract.accept_proposal(proposal_id=proposal_id)
+
+
+# ---------------------------------------------------------------------------
+# Bounded liveness escape hatch: reclaiming a stake stuck behind a
+# proposal that never reached evaluation. Added after a GenLayer Portal
+# steward's review found that evaluate_proposal being permissionlessly
+# retriable does not guarantee it ever converges -- see docs/DESIGN.md.
+# ---------------------------------------------------------------------------
+
+# Must match PROPOSAL_EVALUATION_TIMEOUT_SECONDS in the contract itself.
+_PROPOSAL_EVALUATION_TIMEOUT_SECONDS = 259200
+
+
+def _warp_past_timeout(direct_vm, from_iso: str, extra_seconds: int = 60):
+    base = datetime.fromisoformat(from_iso.replace("Z", "+00:00"))
+    future = base + timedelta(seconds=_PROPOSAL_EVALUATION_TIMEOUT_SECONDS + extra_seconds)
+    direct_vm.warp(future.isoformat().replace("+00:00", "Z"))
+
+
+class TestExpiryReclaim:
+    def test_pending_proposal_cannot_be_reclaimed_before_timeout(self, contract, direct_vm):
+        _register(contract, direct_vm, min_stake=100)
+        proposal_id = _propose(contract, direct_vm, verdict="FAITHFUL", stake=100)
+        with pytest.raises(Exception):
+            contract.reclaim_expired_proposal(proposal_id=proposal_id)
+
+    def test_pending_proposal_can_be_reclaimed_after_timeout(self, contract, direct_vm):
+        _register(contract, direct_vm, min_stake=100)
+        proposal_id = _propose(contract, direct_vm, verdict="FAITHFUL", stake=100)
+        proposal = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        _warp_past_timeout(direct_vm, proposal["submitted_at"])
+        # Must not raise -- emit_transfer(proposer) is exercised on the
+        # expiry-refund path.
+        contract.reclaim_expired_proposal(proposal_id=proposal_id)
+        record = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        assert record["status"] == "expired"
+        assert record["expired_at"]
+        assert record["evaluated_at"] is None
+        assert record["verdict"] is None
+
+    def test_zero_stake_proposal_expiry_skips_transfer_entirely(self, contract, direct_vm):
+        _register(contract, direct_vm, min_stake=0)
+        proposal_id = _propose(contract, direct_vm, verdict="FAITHFUL", stake=0)
+        proposal = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        _warp_past_timeout(direct_vm, proposal["submitted_at"])
+        contract.reclaim_expired_proposal(proposal_id=proposal_id)  # must not raise
+        record = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        assert record["status"] == "expired"
+
+    def test_already_evaluated_proposal_cannot_be_reclaimed(self, contract, direct_vm):
+        """Cannot bypass a resolved forfeiture/refund: once
+        evaluate_proposal resolves the stake, status is "evaluated", and
+        reclaim_expired_proposal's shared "pending" precondition rejects
+        it outright -- regardless of how much time has passed."""
+        _register(contract, direct_vm, min_stake=100)
+        proposal_id = _propose(
+            contract, direct_vm,
+            new_content=json.dumps({"fee_bps": "50", "admin": "0xNewAttackerAddress"}),
+            verdict="MISLEADING", stake=100,
+        )
+        contract.evaluate_proposal(proposal_id=proposal_id)
+        proposal = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        _warp_past_timeout(direct_vm, proposal["submitted_at"])
+        with pytest.raises(Exception):
+            contract.reclaim_expired_proposal(proposal_id=proposal_id)
+
+    def test_expired_proposal_can_no_longer_be_evaluated(self, contract, direct_vm):
+        """The two resolution paths are mutually exclusive: whichever
+        runs first permanently forecloses the other, which is what
+        guarantees the stake is ever refunded/forfeited exactly once."""
+        _register(contract, direct_vm, min_stake=100)
+        proposal_id = _propose(contract, direct_vm, verdict="FAITHFUL", stake=100)
+        proposal = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        _warp_past_timeout(direct_vm, proposal["submitted_at"])
+        contract.reclaim_expired_proposal(proposal_id=proposal_id)
+        with pytest.raises(Exception):
+            contract.evaluate_proposal(proposal_id=proposal_id)
+
+    def test_expired_proposal_cannot_be_reclaimed_twice(self, contract, direct_vm):
+        _register(contract, direct_vm, min_stake=100)
+        proposal_id = _propose(contract, direct_vm, verdict="FAITHFUL", stake=100)
+        proposal = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        _warp_past_timeout(direct_vm, proposal["submitted_at"])
+        contract.reclaim_expired_proposal(proposal_id=proposal_id)
+        with pytest.raises(Exception):
+            contract.reclaim_expired_proposal(proposal_id=proposal_id)
+
+    def test_anyone_can_trigger_reclaim(self, contract, direct_vm, direct_bob):
+        """Permissionless, matching every other lifecycle-advancing method
+        in this contract -- there is no legitimate-vs-illegitimate
+        reclaimer to gate between, only a bounded time condition."""
+        _register(contract, direct_vm, min_stake=100)
+        proposal_id = _propose(contract, direct_vm, verdict="FAITHFUL", stake=100)
+        proposal = json.loads(contract.get_proposal(proposal_id=proposal_id))
+        _warp_past_timeout(direct_vm, proposal["submitted_at"])
+        with direct_vm.prank(direct_bob):
+            contract.reclaim_expired_proposal(proposal_id=proposal_id)  # must not raise
+
+    def test_reclaiming_unknown_proposal_raises(self, contract, direct_vm):
+        with pytest.raises(Exception):
+            contract.reclaim_expired_proposal(proposal_id="proposal-999")
 
 
 # ---------------------------------------------------------------------------
